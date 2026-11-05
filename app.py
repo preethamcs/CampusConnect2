@@ -1,49 +1,70 @@
 import os
+from typing import Any
 from uuid import UUID
-from flask import Flask, jsonify, request
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions
 from postgrest import APIError
-from dotenv import load_dotenv
 
 load_dotenv()
 
-app = Flask(__name__)
+supabase_url = os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+supabase_key = os.environ.get("SUPABASE_PUBLISHABLE_KEY")
+if not supabase_url or not supabase_key:
+    raise RuntimeError("SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY must be configured.")
 
-supabase: Client = create_client(
-    os.environ.get("SUPABASE_URL"),
-    os.environ.get("SUPABASE_PUBLISHABLE_KEY")
-)
+app = FastAPI()
+supabase: Client = create_client(supabase_url, supabase_key)
 
 
-def authenticated_client():
-    authorization = request.headers.get("Authorization", "")
+@app.exception_handler(HTTPException)
+async def handle_http_exception(request: Request, error: HTTPException):
+    return JSONResponse(
+        status_code=error.status_code,
+        content={"error": error.detail},
+        headers=error.headers,
+    )
+
+
+def authenticated_client(
+    authorization: str | None = Header(default=None),
+) -> tuple[Client, Any]:
+    authorization = authorization or ""
     scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or not token:
-        return None, None
+        raise HTTPException(status_code=401, detail="A valid bearer token is required.")
 
     client = create_client(
-        os.environ.get("SUPABASE_URL"),
-        os.environ.get("SUPABASE_PUBLISHABLE_KEY"),
+        supabase_url,
+        supabase_key,
         ClientOptions(headers={"Authorization": f"Bearer {token}"}),
     )
     try:
         user = client.auth.get_user(token).user
     except Exception:
-        return None, None
+        raise HTTPException(status_code=401, detail="A valid bearer token is required.")
     return client, user
 
 
-def unauthorized():
-    return jsonify({"error": "A valid bearer token is required."}), 401
+def validate_event_id(event_id: str) -> str:
+    try:
+        UUID(event_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid event ID.")
+    return event_id
 
 
-@app.route('/')
+@app.get('/', response_class=HTMLResponse)
 def index():
     try:
         response = supabase.table('users').select("*").execute()
     except APIError as error:
-        return f'<p>Error loading users: {error.message}</p>'
+        return HTMLResponse(
+            content=f'<p>Error loading users: {error.message}</p>',
+            status_code=500,
+        )
 
     users = response.data
 
@@ -59,54 +80,48 @@ def index():
 def list_events():
     try:
         response = supabase.table('events').select('*').execute()
-        return jsonify(response.data)
+        return response.data
     except APIError as error:
-        return jsonify({"error": error.message}), 500
+        return JSONResponse({"error": error.message}, status_code=500)
 
 
-@app.get('/api/events/<event_id>')
+@app.get('/api/events/{event_id}')
 def get_event(event_id):
     try:
-        UUID(event_id)
+        validate_event_id(event_id)
         response = supabase.table('events').select('*').eq(
             'event_id', event_id
         ).limit(1).execute()
         if not response.data:
-            return jsonify({"error": "Event not found."}), 404
-        return jsonify(response.data[0])
-    except ValueError:
-        return jsonify({"error": "Invalid event ID."}), 400
+            raise HTTPException(status_code=404, detail="Event not found.")
+        return response.data[0]
+    except HTTPException:
+        raise
     except APIError as error:
-        return jsonify({"error": error.message}), 500
+        return JSONResponse({"error": error.message}, status_code=500)
 
 
 @app.post('/api/registrations')
-def create_registration():
-    client, user = authenticated_client()
-    if user is None:
-        return unauthorized()
-
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({"error": "A JSON object with event_id is required."}), 400
+def create_registration(payload: dict[str, Any], auth=Depends(authenticated_client)):
+    client, user = auth
     event_id = payload.get('event_id')
     try:
         UUID(event_id)
     except (TypeError, ValueError):
-        return jsonify({"error": "A valid event_id is required."}), 400
+        raise HTTPException(status_code=400, detail="A valid event_id is required.")
 
     try:
         event_response = client.table('events').select(
             'event_id, capacity'
         ).eq('event_id', event_id).limit(1).execute()
         if not event_response.data:
-            return jsonify({"error": "Event not found."}), 404
+            raise HTTPException(status_code=404, detail="Event not found.")
 
         existing = client.table('registration').select('id').eq(
             'student_id', user.id
         ).eq('event_id', event_id).limit(1).execute()
         if existing.data:
-            return jsonify({"error": "Already registered for this event."}), 409
+            raise HTTPException(status_code=409, detail="Already registered for this event.")
 
         capacity = event_response.data[0].get('capacity')
         if capacity is not None:
@@ -114,60 +129,55 @@ def create_registration():
                 'id', count='exact'
             ).eq('event_id', event_id).execute()
             if registrations.count is not None and registrations.count >= capacity:
-                return jsonify({"error": "Event is at capacity."}), 409
+                raise HTTPException(status_code=409, detail="Event is at capacity.")
 
         response = client.table('registration').insert({
             'student_id': user.id,
             'event_id': event_id,
         }).execute()
         registration = response.data[0] if response.data else None
-        return jsonify(registration), 201
+        return JSONResponse(registration, status_code=201)
+    except HTTPException:
+        raise
     except APIError as error:
         if error.code == '23505':
-            return jsonify({"error": "Already registered for this event."}), 409
-        return jsonify({"error": error.message}), 500
+            raise HTTPException(status_code=409, detail="Already registered for this event.")
+        return JSONResponse({"error": error.message}, status_code=500)
 
 
 @app.get('/api/me/registrations')
-def list_my_registrations():
-    client, user = authenticated_client()
-    if user is None:
-        return unauthorized()
-
+def list_my_registrations(auth=Depends(authenticated_client)):
+    client, user = auth
     try:
         response = client.table('registration').select('*').eq(
             'student_id', user.id
         ).execute()
-        return jsonify(response.data)
+        return response.data
     except APIError as error:
-        return jsonify({"error": error.message}), 500
+        return JSONResponse({"error": error.message}, status_code=500)
 
 
-@app.get('/api/events/<event_id>/registrations')
-def list_event_registrations(event_id):
-    client, user = authenticated_client()
-    if user is None:
-        return unauthorized()
-
+@app.get('/api/events/{event_id}/registrations')
+def list_event_registrations(event_id: str, auth=Depends(authenticated_client)):
+    client, user = auth
     try:
-        UUID(event_id)
+        validate_event_id(event_id)
         event_response = client.table('events').select(
             'event_id, student_id'
         ).eq('event_id', event_id).limit(1).execute()
         if not event_response.data:
-            return jsonify({"error": "Event not found."}), 404
+            raise HTTPException(status_code=404, detail="Event not found.")
         if event_response.data[0]['student_id'] != user.id:
-            return jsonify({"error": "Only the event organizer can view registrations."}), 403
+            raise HTTPException(
+                status_code=403,
+                detail="Only the event organizer can view registrations.",
+            )
 
         response = client.table('registration').select('*').eq(
             'event_id', event_id
         ).execute()
-        return jsonify(response.data)
-    except ValueError:
-        return jsonify({"error": "Invalid event ID."}), 400
+        return response.data
+    except HTTPException:
+        raise
     except APIError as error:
-        return jsonify({"error": error.message}), 500
-
-
-if __name__ == '__main__':
-    app.run(debug=True)
+        return JSONResponse({"error": error.message}, status_code=500)
